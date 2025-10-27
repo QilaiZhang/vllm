@@ -288,6 +288,7 @@ class Qwen3MoeAttention(nn.Module):
         return output
 
 
+@support_torch_compile
 class Qwen3MoeDecoderLayer(nn.Module):
 
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:

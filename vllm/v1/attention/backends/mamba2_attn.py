@@ -2,14 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import ClassVar, Optional
 
 import torch
 
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.config import VllmConfig
 from vllm.v1.attention.backends.mamba_attn import (
-    BaseMambaAttentionMetadataBuilder)
+    AttentionCGSupport, BaseMambaAttentionMetadataBuilder)
 from vllm.v1.attention.backends.utils import (PAD_SLOT_ID,
                                               CommonAttentionMetadata,
                                               compute_causal_conv1d_metadata,
@@ -138,6 +138,8 @@ class Mamba2AttentionMetadata:
 
 class Mamba2AttentionMetadataBuilder(
         BaseMambaAttentionMetadataBuilder[Mamba2AttentionMetadata]):
+    
+    aclgraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
 
     def __init__(self, kv_cache_spec: AttentionSpec, layer_names: list[str],
                  vllm_config: VllmConfig, device: torch.device):
