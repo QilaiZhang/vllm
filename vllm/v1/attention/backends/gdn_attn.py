@@ -5,6 +5,7 @@
 from dataclasses import dataclass
 
 import torch
+import copy
 
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.attention.backends.utils import PAD_SLOT_ID
@@ -62,6 +63,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
     reorder_batch_threshold: int = 1
+
+    supports_update_block_table: bool = True
 
     def __init__(
         self,
@@ -373,3 +376,113 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         m._num_computed_tokens_cpu = m.seq_lens_cpu - num_accepted_tokens.cpu()
 
         return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
+
+    def update_block_table(
+        self,
+        metadata: GDNAttentionMetadata,
+        blk_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> GDNAttentionMetadata:
+        new_metadata = copy.copy(metadata)
+        spec_sequence_masks = new_metadata.spec_sequence_masks
+        num_prefills = new_metadata.num_prefills
+        num_decodes = new_metadata.num_decodes
+        num_spec_decodes = new_metadata.num_spec_decodes
+        num_spec_decode_tokens = new_metadata.num_spec_decode_tokens
+        batch_size = new_metadata.num_actual_tokens
+        spec_query_start_loc = new_metadata.spec_query_start_loc
+        non_spec_query_start_loc = new_metadata.non_spec_query_start_loc
+        spec_token_indx = new_metadata.spec_token_indx
+        non_spec_token_indx = new_metadata.non_spec_token_indx
+        num_accepted_tokens = new_metadata.num_accepted_tokens
+
+        # update spec_state_indices_tensor with blk_table
+        if spec_sequence_masks is None:
+            spec_state_indices_tensor = None
+            non_spec_state_indices_tensor = blk_table[:, 0]
+        else:
+            if num_prefills == 0 and num_decodes == 0:
+                spec_state_indices_tensor = blk_table[:, : self.num_spec + 1]
+                non_spec_state_indices_tensor = None
+            else:
+                spec_state_indices_tensor = blk_table[
+                    spec_sequence_masks, : self.num_spec + 1
+                ]
+                non_spec_state_indices_tensor = blk_table[~spec_sequence_masks, 0]
+
+        if (
+            self.use_full_cuda_graph
+            and num_prefills == 0
+            and num_decodes == 0
+            and num_spec_decodes <= self.decode_cudagraph_max_bs
+            and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
+        ):
+            self.spec_state_indices_tensor[:num_spec_decodes].copy_(
+                spec_state_indices_tensor, non_blocking=True
+            )
+            spec_state_indices_tensor = self.spec_state_indices_tensor[:batch_size]
+            spec_state_indices_tensor[num_spec_decodes:].fill_(PAD_SLOT_ID)
+
+            self.spec_sequence_masks[:num_spec_decodes].copy_(
+                spec_sequence_masks, non_blocking=True
+            )
+            spec_sequence_masks = self.spec_sequence_masks[:batch_size]
+            spec_sequence_masks[num_spec_decodes:].fill_(False)
+
+            assert non_spec_token_indx is not None and spec_token_indx is not None
+            self.non_spec_token_indx[: non_spec_token_indx.size(0)].copy_(
+                non_spec_token_indx, non_blocking=True
+            )
+            non_spec_token_indx = self.non_spec_token_indx[
+                : non_spec_token_indx.size(0)
+            ]
+
+            self.spec_token_indx[: spec_token_indx.size(0)].copy_(
+                spec_token_indx, non_blocking=True
+            )
+            spec_token_indx = self.spec_token_indx[: spec_token_indx.size(0)]
+
+            self.spec_query_start_loc[: num_spec_decodes + 1].copy_(
+                spec_query_start_loc, non_blocking=True
+            )
+            spec_num_query_tokens = spec_query_start_loc[-1]  # type: ignore[index]
+            spec_query_start_loc = self.spec_query_start_loc[: batch_size + 1]
+            spec_query_start_loc[num_spec_decodes + 1 :].fill_(spec_num_query_tokens)
+
+            self.num_accepted_tokens[:num_spec_decodes].copy_(
+                num_accepted_tokens, non_blocking=True
+            )
+            num_accepted_tokens = self.num_accepted_tokens[:batch_size]
+            num_accepted_tokens[num_spec_decodes:].fill_(1)
+
+        if (
+            self.use_full_cuda_graph
+            and num_prefills == 0
+            and num_spec_decodes == 0
+            and num_decodes <= self.decode_cudagraph_max_bs
+        ):
+            self.non_spec_state_indices_tensor[:num_decodes].copy_(
+                non_spec_state_indices_tensor, non_blocking=True
+            )
+            non_spec_state_indices_tensor = self.non_spec_state_indices_tensor[
+                :batch_size
+            ]
+            non_spec_state_indices_tensor[num_decodes:].fill_(PAD_SLOT_ID)
+
+            self.non_spec_query_start_loc[: num_decodes + 1].copy_(
+                non_spec_query_start_loc, non_blocking=True
+            )
+            non_spec_num_query_tokens = non_spec_query_start_loc[-1]  # type: ignore[index]
+            non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
+            non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
+
+        new_metadata.spec_state_indices_tensor = spec_state_indices_tensor
+        new_metadata.spec_sequence_masks = spec_sequence_masks
+        new_metadata.non_spec_token_indx = non_spec_token_indx
+        new_metadata.spec_token_indx = spec_token_indx
+        new_metadata.spec_query_start_loc = spec_query_start_loc
+        new_metadata.num_accepted_tokens = num_accepted_tokens
+
+        new_metadata.non_spec_state_indices_tensor = non_spec_state_indices_tensor
+        new_metadata.non_spec_query_start_loc = non_spec_query_start_loc
+        return new_metadata
