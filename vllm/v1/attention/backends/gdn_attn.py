@@ -5,6 +5,7 @@
 from dataclasses import dataclass
 
 import torch
+import copy
 
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.attention.backends.utils import PAD_SLOT_ID
@@ -62,6 +63,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
     reorder_batch_threshold: int = 1
+
+    supports_update_block_table: bool = True
 
     def __init__(
         self,
@@ -373,3 +376,62 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         m._num_computed_tokens_cpu = m.seq_lens_cpu - num_accepted_tokens.cpu()
 
         return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
+
+    def update_block_table(
+        self,
+        metadata: GDNAttentionMetadata,
+        blk_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> GDNAttentionMetadata:
+        new_metadata = copy.copy(metadata)
+        spec_sequence_masks = new_metadata.spec_sequence_masks
+        num_prefills = new_metadata.num_prefills
+        num_decodes = new_metadata.num_decodes
+        num_spec_decodes = new_metadata.num_spec_decodes
+        num_spec_decode_tokens = new_metadata.num_spec_decode_tokens
+        batch_size = new_metadata.num_actual_tokens
+
+        # update spec_state_indices_tensor with blk_table
+        if spec_sequence_masks is None:
+            new_spec_state_indices_tensor = None
+            new_non_spec_state_indices_tensor = blk_table[:, 0]
+        else:
+            if num_prefills == 0 and num_decodes == 0:
+                new_spec_state_indices_tensor = blk_table[:, : self.num_spec + 1]
+                new_non_spec_state_indices_tensor = None
+            else:
+                new_spec_state_indices_tensor = blk_table[
+                    spec_sequence_masks, : self.num_spec + 1
+                ]
+                new_non_spec_state_indices_tensor = blk_table[~spec_sequence_masks, 0]
+
+        if (
+            self.use_full_cuda_graph
+            and num_prefills == 0
+            and num_decodes == 0
+            and num_spec_decodes <= self.decode_cudagraph_max_bs
+            and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
+        ):
+            self.spec_state_indices_tensor[:num_spec_decodes].copy_(
+                new_spec_state_indices_tensor, non_blocking=True
+            )
+            new_spec_state_indices_tensor = self.spec_state_indices_tensor[:batch_size]
+            new_spec_state_indices_tensor[num_spec_decodes:].fill_(PAD_SLOT_ID)
+
+        if (
+            self.use_full_cuda_graph
+            and num_prefills == 0
+            and num_spec_decodes == 0
+            and num_decodes <= self.decode_cudagraph_max_bs
+        ):
+            self.non_spec_state_indices_tensor[:num_decodes].copy_(
+                new_non_spec_state_indices_tensor, non_blocking=True
+            )
+            new_non_spec_state_indices_tensor = self.non_spec_state_indices_tensor[
+                :batch_size
+            ]
+            new_non_spec_state_indices_tensor[num_decodes:].fill_(PAD_SLOT_ID)
+
+        new_metadata.spec_state_indices_tensor = new_spec_state_indices_tensor
+        new_metadata.non_spec_state_indices_tensor = new_non_spec_state_indices_tensor
+        return new_metadata
