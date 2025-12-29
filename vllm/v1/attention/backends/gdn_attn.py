@@ -132,89 +132,125 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
 
     def build(  # type: ignore[override]
-        self,
-        common_prefix_len: int,
-        common_attn_metadata: CommonAttentionMetadata,
-        num_accepted_tokens: torch.Tensor | None = None,
-        num_decode_draft_tokens_cpu: torch.Tensor | None = None,
-        fast_build: bool = False,
-    ) -> GDNAttentionMetadata:
+    self,
+    common_prefix_len: int,
+    common_attn_metadata: CommonAttentionMetadata,
+    num_accepted_tokens: torch.Tensor | None = None,
+    num_decode_draft_tokens_cpu: torch.Tensor | None = None,
+    fast_build: bool = False,
+) -> GDNAttentionMetadata:
         m = common_attn_metadata
 
         query_start_loc = m.query_start_loc
-        context_lens = m.num_computed_tokens_cpu
-        context_lens_tensor = context_lens.to(query_start_loc.device, non_blocking=True)
+        device = query_start_loc.device
+
+        # OPT-1: 尽量使用 metadata 自带的 CPU 副本做“计数/分支”，避免 GPU .item() 同步。
+        #       如果没有 CPU 副本，fallback 会产生 D2H 拷贝（会慢）；建议确保上游提供 query_start_loc_cpu。
+        query_start_loc_cpu = getattr(m, "query_start_loc_cpu", None)
+        if query_start_loc_cpu is None:
+            query_start_loc_cpu = query_start_loc.detach().cpu()
+
+        context_lens_cpu = m.num_computed_tokens_cpu  # CPU tensor
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
 
-        if (
-            not self.use_spec_decode
-            or num_decode_draft_tokens_cpu is None
-            or num_decode_draft_tokens_cpu[num_decode_draft_tokens_cpu >= 0]
-            .sum()
-            .item()
-            == 0
-        ):
-            spec_sequence_masks = None
-            num_spec_decodes = 0
-        else:
-            spec_sequence_masks = num_decode_draft_tokens_cpu >= 0
-            num_spec_decodes = spec_sequence_masks.sum().item()
-            if num_spec_decodes == 0:
-                spec_sequence_masks = None
-            else:
-                spec_sequence_masks = spec_sequence_masks.to(
-                    query_start_loc.device, non_blocking=True
-                )
+        # ---------------------------
+        # 1) 判定是否存在 spec decode（严格保持原语义）
+        # ---------------------------
+        spec_sequence_masks_cpu = None          # CPU bool mask (len = num_reqs)
+        spec_sequence_masks = None              # GPU bool mask
+        num_spec_decodes = 0
 
+        # OPT-2: “是否存在 spec”的判定保持原逻辑：
+        #        只有 masked 的 draft token 之和 > 0 才认为本 step 有 spec，
+        #        而不是只要 mask.sum()>0 就进入 spec。
+        if self.use_spec_decode and num_decode_draft_tokens_cpu is not None:
+            mask_cpu = (num_decode_draft_tokens_cpu >= 0)
+            if mask_cpu.any().item():
+                total_draft = num_decode_draft_tokens_cpu[mask_cpu].sum().item()
+            else:
+                total_draft = 0
+
+            if total_draft > 0:
+                spec_sequence_masks_cpu = mask_cpu
+                num_spec_decodes = mask_cpu.sum().item()
+                if num_spec_decodes > 0:
+                    # OPT-3: 只有在确实需要走 spec 路径时才把 mask H2D（减少无效 H2D）
+                    spec_sequence_masks = spec_sequence_masks_cpu.to(device, non_blocking=True)
+
+        # ---------------------------
+        # 2) 走非 spec 或 spec 路径，构造 metadata
+        # ---------------------------
         if spec_sequence_masks is None:
+            # --- 非 spec 路径（保持原行为） ---
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
                 split_decodes_and_prefills(m, decode_threshold=1)
             )
             num_spec_decode_tokens = 0
+
             spec_token_indx = None
             non_spec_token_indx = None
             spec_state_indices_tensor = None
             non_spec_state_indices_tensor = m.block_table_tensor[:, 0]
+
             spec_query_start_loc = None
             non_spec_query_start_loc = query_start_loc
             num_accepted_tokens = None
+
         else:
+            # --- spec 路径 ---
+            assert spec_sequence_masks_cpu is not None
+
+            # OPT-4: 计数全部用 CPU query_start_loc_cpu / query_lens_cpu 来做，
+            #        避免原版 (tensor.sum().item()) 在 GPU 上触发同步。
+            query_lens_cpu = (query_start_loc_cpu[1:] - query_start_loc_cpu[:-1])
+            non_spec_mask_cpu = ~spec_sequence_masks_cpu
+            non_spec_query_lens_cpu = query_lens_cpu[non_spec_mask_cpu]
+
+            num_decodes = (non_spec_query_lens_cpu == 1).sum().item()
+            num_prefills = non_spec_query_lens_cpu.numel() - num_decodes
+            num_decode_tokens = num_decodes
+            num_prefill_tokens = non_spec_query_lens_cpu.sum().item() - num_decode_tokens
+
+            total_tokens_cpu = query_start_loc_cpu[-1].item()
+            num_spec_decode_tokens = total_tokens_cpu - num_prefill_tokens - num_decode_tokens
+
+            # GPU query_lens 仅在需要构造 token mask / cumsum 时用
             query_lens = query_start_loc[1:] - query_start_loc[:-1]
 
-            non_spec_query_lens = query_lens[~spec_sequence_masks]
-            num_decodes = (non_spec_query_lens == 1).sum().item()
-            num_prefills = non_spec_query_lens.size(0) - num_decodes
-            num_decode_tokens = num_decodes
-            num_prefill_tokens = non_spec_query_lens.sum().item() - num_decode_tokens
-            num_spec_decode_tokens = (
-                query_lens.sum().item() - num_prefill_tokens - num_decode_tokens
-            )
-
             if num_prefills == 0 and num_decodes == 0:
+                # --- 纯 spec 场景 ---
+                # OPT-5: 避免 query_start_loc[-1].item()（GPU 同步），用 CPU total_tokens_cpu。
                 spec_token_size = min(
                     num_spec_decodes * (self.num_spec + 1),
-                    query_start_loc[-1].item(),
+                    total_tokens_cpu,
                 )
                 spec_token_indx = torch.arange(
-                    spec_token_size,
-                    dtype=torch.int32,
-                    device=query_start_loc.device,
+                    spec_token_size, dtype=torch.int32, device=device
                 )
-                non_spec_token_indx = torch.empty(
-                    0, dtype=torch.int32, device=query_start_loc.device
-                )
+                non_spec_token_indx = torch.empty(0, dtype=torch.int32, device=device)
+
                 spec_state_indices_tensor = m.block_table_tensor[:, : self.num_spec + 1]
                 non_spec_state_indices_tensor = None
                 spec_query_start_loc = query_start_loc
                 non_spec_query_start_loc = None
+
             else:
-                spec_token_masks = torch.repeat_interleave(
-                    spec_sequence_masks, query_lens
-                )
-                index = torch.argsort(spec_token_masks, stable=True)
-                num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
-                non_spec_token_indx = index[:num_non_spec_tokens]
-                spec_token_indx = index[num_non_spec_tokens:]
+                # --- 混合场景（同时存在 spec / non-spec token） ---
+                # OPT-6: 用 stable partition 代替 torch.argsort(bool_mask)：
+                #        argsort 是 O(N log N)；我们只需要把 False/True 分组且保持原顺序（stable）。
+                #        nonzero 返回的索引天然递增 = stable。
+                spec_token_masks = torch.repeat_interleave(spec_sequence_masks, query_lens)
+
+                non_spec_token_indx = torch.nonzero(
+                    ~spec_token_masks, as_tuple=False
+                ).flatten()
+
+                spec_token_indx = torch.nonzero(
+                    spec_token_masks, as_tuple=False
+                ).flatten()
+
+                # （可选健壮性检查，线上可关）
+                # assert non_spec_token_indx.numel() == (num_prefill_tokens + num_decode_tokens)
 
                 spec_state_indices_tensor = m.block_table_tensor[
                     spec_sequence_masks, : self.num_spec + 1
@@ -223,19 +259,26 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     ~spec_sequence_masks, 0
                 ]
 
-                spec_query_start_loc = torch.zeros(
-                    num_spec_decodes + 1,
+                # OPT-7: 减少 memset：原版用 torch.zeros 再 cumsum，
+                #        这里用 empty + 手动置 0 + out=cumsum（小优化，但更干净）。
+                spec_query_start_loc = torch.empty(
+                    (num_spec_decodes + 1,),
                     dtype=torch.int32,
-                    device=query_start_loc.device,
+                    device=device,
                 )
+                spec_query_start_loc[0].zero_()
                 torch.cumsum(
-                    query_lens[spec_sequence_masks], dim=0, out=spec_query_start_loc[1:]
+                    query_lens[spec_sequence_masks],
+                    dim=0,
+                    out=spec_query_start_loc[1:],
                 )
-                non_spec_query_start_loc = torch.zeros(
-                    query_lens.size(0) - num_spec_decodes + 1,
+
+                non_spec_query_start_loc = torch.empty(
+                    (query_lens.size(0) - num_spec_decodes + 1,),
                     dtype=torch.int32,
-                    device=query_start_loc.device,
+                    device=device,
                 )
+                non_spec_query_start_loc[0].zero_()
                 torch.cumsum(
                     query_lens[~spec_sequence_masks],
                     dim=0,
@@ -243,12 +286,20 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
             assert num_accepted_tokens is not None
+            # 保持原逻辑：accepted_tokens 仅保留 spec sequences
             num_accepted_tokens = num_accepted_tokens[spec_sequence_masks]
 
+        # ---------------------------
+        # 3) Conv1D metadata（prefill 才需要）
+        # ---------------------------
         if num_prefills > 0:
-            has_initial_state = context_lens_tensor > 0
-            if spec_sequence_masks is not None:
-                has_initial_state = has_initial_state[~spec_sequence_masks]
+            # OPT-8: 避免把 context_lens(int) 整体搬到 GPU。
+            #        先在 CPU 上算 bool，再把 bool H2D（更小、更省带宽）。
+            has_initial_state_cpu = (context_lens_cpu > 0)
+            if spec_sequence_masks_cpu is not None:
+                has_initial_state_cpu = has_initial_state_cpu[~spec_sequence_masks_cpu]
+            has_initial_state = has_initial_state_cpu.to(device, non_blocking=True)
+
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
                 compute_causal_conv1d_metadata(non_spec_query_start_loc)
             )
