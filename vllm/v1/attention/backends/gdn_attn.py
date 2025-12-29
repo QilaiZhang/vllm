@@ -155,7 +155,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_accepted_tokens: torch.Tensor | None = None,
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
-    ) -> GDNAttentionMetadata:
+) -> GDNAttentionMetadata:
         m = common_attn_metadata
 
         query_start_loc = m.query_start_loc
@@ -204,18 +204,20 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_query_start_loc = query_start_loc
             non_spec_query_start_loc_cpu = query_start_loc_cpu
             num_accepted_tokens = None
+
         else:
             query_lens = query_start_loc[1:] - query_start_loc[:-1]
+            query_lens_cpu = (query_start_loc_cpu[1:] - query_start_loc_cpu[:-1])
             assert spec_sequence_masks_cpu is not None
-            query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            non_spec_mask_cpu = ~spec_sequence_masks_cpu
+            non_spec_query_lens_cpu = query_lens_cpu[non_spec_mask_cpu]
 
-            non_spec_query_lens = query_lens[~spec_sequence_masks]
-            num_decodes = (non_spec_query_lens == 1).sum().item()
-            num_prefills = non_spec_query_lens.size(0) - num_decodes
+            num_decodes = (non_spec_query_lens_cpu == 1).sum().item()
+            num_prefills = non_spec_query_lens_cpu.numel() - num_decodes
             num_decode_tokens = num_decodes
-            num_prefill_tokens = non_spec_query_lens.sum().item() - num_decode_tokens
+            num_prefill_tokens = non_spec_query_lens_cpu.sum().item() - num_decode_tokens
             num_spec_decode_tokens = (
-                query_lens.sum().item() - num_prefill_tokens - num_decode_tokens
+                query_lens_cpu.sum().item() - num_prefill_tokens - num_decode_tokens
             )
 
             if num_prefills == 0 and num_decodes == 0:
@@ -240,10 +242,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_token_masks = torch.repeat_interleave(
                     spec_sequence_masks, query_lens
                 )
-                index = torch.argsort(spec_token_masks, stable=True)
-                num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
-                non_spec_token_indx = index[:num_non_spec_tokens]
-                spec_token_indx = index[num_non_spec_tokens:]
+
+                non_spec_token_indx = torch.nonzero(
+                    ~spec_token_masks, as_tuple=False
+                ).flatten()
+
+                spec_token_indx = torch.nonzero(
+                    spec_token_masks, as_tuple=False
+                ).flatten()
 
                 spec_state_indices_tensor = block_table_tensor[
                     spec_sequence_masks, : self.num_spec + 1
@@ -252,19 +258,23 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     ~spec_sequence_masks, 0
                 ]
 
-                spec_query_start_loc = torch.zeros(
-                    num_spec_decodes + 1,
+                spec_query_start_loc = torch.empty(
+                    (num_spec_decodes + 1,),
                     dtype=torch.int32,
                     device=query_start_loc.device,
                 )
+                spec_query_start_loc[0].zero_()
                 torch.cumsum(
-                    query_lens[spec_sequence_masks], dim=0, out=spec_query_start_loc[1:]
+                    query_lens[spec_sequence_masks],
+                    dim=0,
+                    out=spec_query_start_loc[1:],
                 )
-                non_spec_query_start_loc = torch.zeros(
+                non_spec_query_start_loc = torch.empty(
                     query_lens.size(0) - num_spec_decodes + 1,
                     dtype=torch.int32,
                     device=query_start_loc.device,
                 )
+                non_spec_query_start_loc[0].zero_()
                 torch.cumsum(
                     query_lens[~spec_sequence_masks],
                     dim=0,
