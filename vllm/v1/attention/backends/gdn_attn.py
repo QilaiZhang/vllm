@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Backend for GatedDeltaNet attention."""
 
+import copy
 from dataclasses import dataclass
 
 import torch
-import copy
 
 from vllm.config import VllmConfig
 from vllm.v1.attention.backend import (
@@ -43,6 +43,7 @@ class GDNAttentionMetadata:
     num_spec_decode_tokens: int
     num_actual_tokens: int
 
+    seq_lens: int
     has_initial_state: torch.Tensor | None = None
 
     spec_query_start_loc: torch.Tensor | None = None  # shape: [num_spec_decodes + 1,]
@@ -155,7 +156,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_accepted_tokens: torch.Tensor | None = None,
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
-) -> GDNAttentionMetadata:
+    ) -> GDNAttentionMetadata:
         m = common_attn_metadata
 
         query_start_loc = m.query_start_loc
@@ -207,15 +208,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         else:
             query_lens = query_start_loc[1:] - query_start_loc[:-1]
-            query_lens_cpu = (query_start_loc_cpu[1:] - query_start_loc_cpu[:-1])
             assert spec_sequence_masks_cpu is not None
-            non_spec_mask_cpu = ~spec_sequence_masks_cpu
-            non_spec_query_lens_cpu = query_lens_cpu[non_spec_mask_cpu]
+            query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            non_spec_query_lens = query_lens_cpu[~spec_sequence_masks_cpu]
 
-            num_decodes = (non_spec_query_lens_cpu == 1).sum().item()
-            num_prefills = non_spec_query_lens_cpu.numel() - num_decodes
+            num_decodes = (non_spec_query_lens == 1).sum().item()
+            num_prefills = non_spec_query_lens.size(0) - num_decodes
             num_decode_tokens = num_decodes
-            num_prefill_tokens = non_spec_query_lens_cpu.sum().item() - num_decode_tokens
+            num_prefill_tokens = non_spec_query_lens.sum().item() - num_decode_tokens
             num_spec_decode_tokens = (
                 query_lens_cpu.sum().item() - num_prefill_tokens - num_decode_tokens
             )
@@ -242,15 +242,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_token_masks = torch.repeat_interleave(
                     spec_sequence_masks, query_lens
                 )
-
                 non_spec_token_indx = torch.nonzero(
                     ~spec_token_masks, as_tuple=False
                 ).flatten()
-
                 spec_token_indx = torch.nonzero(
                     spec_token_masks, as_tuple=False
                 ).flatten()
-
                 spec_state_indices_tensor = block_table_tensor[
                     spec_sequence_masks, : self.num_spec + 1
                 ]
@@ -385,6 +382,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_spec_decodes=num_spec_decodes,
             num_spec_decode_tokens=num_spec_decode_tokens,
             num_actual_tokens=m.num_actual_tokens,
+            seq_lens=m.seq_lens,
             has_initial_state=has_initial_state,
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
@@ -443,20 +441,28 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         spec_token_indx = new_metadata.spec_token_indx
         non_spec_token_indx = new_metadata.non_spec_token_indx
         num_accepted_tokens = new_metadata.num_accepted_tokens
+        block_table_tensor = mamba_get_block_table_tensor(
+            blk_table,
+            new_metadata.seq_lens,
+            self.kv_cache_spec,
+            self.vllm_config.cache_config.mamba_cache_mode,
+        )
 
         # update spec_state_indices_tensor with blk_table
         if spec_sequence_masks is None:
             spec_state_indices_tensor = None
-            non_spec_state_indices_tensor = blk_table[:, 0]
+            non_spec_state_indices_tensor = block_table_tensor[:, 0]
         else:
             if num_prefills == 0 and num_decodes == 0:
-                spec_state_indices_tensor = blk_table[:, : self.num_spec + 1]
+                spec_state_indices_tensor = block_table_tensor[:, : self.num_spec + 1]
                 non_spec_state_indices_tensor = None
             else:
-                spec_state_indices_tensor = blk_table[
+                spec_state_indices_tensor = block_table_tensor[
                     spec_sequence_masks, : self.num_spec + 1
                 ]
-                non_spec_state_indices_tensor = blk_table[~spec_sequence_masks, 0]
+                non_spec_state_indices_tensor = block_table_tensor[
+                    ~spec_sequence_masks, 0
+                ]
 
         if (
             self.use_full_cuda_graph
